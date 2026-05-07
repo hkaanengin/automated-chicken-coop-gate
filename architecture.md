@@ -2,7 +2,7 @@
 
 ---
 
-## Project Status (as of May 1, 2026)
+## Project Status
 
 **Current phase:** Bench-testing, direct point-to-point wiring (no breadboard).
 
@@ -13,8 +13,11 @@
 - ✅ **Stage 4:** Battery + P1006 charge controller online, relay coils powered via JD-VCC. Audible clicks on every relay transition during the boot-time exercise, no boot glitches, LOAD output worked without PV connected. See Section 9 → Stage 4 for details.
 - ✅ **Stage 5a:** Inline 7.5A blade fuse installed on battery + lead, actuator wired through relays in H-bridge configuration (R1/R2 NO → 12V+ junction, R1/R2 NC → GND junction, actuator leads → R1/R2 COM). See Section 9 → Stage 5a for details.
 - ✅ **Stage 5b:** Direction verification with 3-second bursts — R1 extended (close direction), R2 retracted (open direction). Wiring is correct, no lead swap needed. See Section 9 → Stage 5b for details.
+- ✅ **Stage 5c:** Full integration test passed — power-on forced-close (27 s extend), scheduled open at `OPEN_TIME` (27 s retract) and scheduled close at `CLOSE_TIME` (27 s extend) both fired on time, all three switch positions (Manual Open, Manual Close, Center) produced correct actuator behavior, and switch-to-center correctly resynced door state to the current schedule. See Section 9 → Stage 5c for details.
 
-**Next up:** Stage 5c — upload the full Section 5 control code with temporary `OPEN_TIME`/`CLOSE_TIME` values ~2 minutes apart, then verify the full bench sequence end-to-end: power-on forced-close (27 s extend), scheduled open at `OPEN_TIME` (27 s retract), all three switch positions trigger correct actuator behavior, and switch-to-center resyncs door state to current time.
+**Next up:**
+- **Stage 5d** — transition Arduino off USB and onto VIN-from-12V-bus power, verify the system still works end-to-end. Small but necessary bench step before physical install (every stage so far has run on USB).
+- **Stage 6** — add deep sleep (PWR_DOWN + watchdog timer + switch interrupts) to extend battery life. Planned for a later session. See Section 9 → Stage 6 for the design.
 ---
 
 ## 1. Project Overview
@@ -562,7 +565,7 @@ digitalWrite(RELAY_1, LOW);    // then energize this one
 
 **Implication for 5c:** Because the wiring matches the design convention, the Section 5 pseudocode can be uploaded as-written — `RELAY_1` (D7) drives close, `RELAY_2` (D8) drives open, no inversions.
 
-#### 5c: Full Integration Test
+#### 5c: Full Integration Test ✅ COMPLETE
 
 **Preparation:**
 1. Upload the final control code (Section 5 pseudocode) with temporary `OPEN_TIME` and `CLOSE_TIME` values 2 minutes apart — e.g., open at current time + 1 minute, close at current time + 3 minutes.
@@ -577,13 +580,21 @@ digitalWrite(RELAY_1, LOW);    // then energize this one
 6. Return switch to center — verify Arduino re-evaluates time and drives door to correct state.
 7. Wait through a full open/close cycle on schedule — verify everything works without intervention.
 
-**Pass criteria (Stage 5):**
-- Power-on forced-close routine completes successfully.
-- All three switch positions produce correct actuator behavior.
-- Scheduled open/close transitions work without manual intervention.
-- Returning from manual to auto mode correctly resyncs door state with current time.
+**Evidence observed:**
+- Power-on forced-close completed cleanly: actuator extended for 27 s, internal limit switch cut the motor at end of stroke, `door_state` initialized to `CLOSED`.
+- Scheduled open at `OPEN_TIME`: actuator retracted for 27 s as expected.
+- Scheduled close at `CLOSE_TIME`: actuator extended for 27 s as expected.
+- Manual Open (Position II) from a closed door: actuator retracted, door opened.
+- Manual Close (Position I) from an open door: actuator extended, door closed.
+- Switch returned to center while inside the open window: auto mode evaluated the schedule and drove the actuator back to retract (door reopened) — exactly the resync behavior described in Section 4 and noted as open question #2 below.
 
-**Once Stage 5 passes, the bench test is complete.** Remaining work is physical: enclosure mounting, door mechanism integration, solar panel installation, and field tuning of `OPEN_TIME` / `CLOSE_TIME`.
+**Pass criteria (Stage 5) — all met:**
+- ✅ Power-on forced-close routine completes successfully.
+- ✅ All three switch positions produce correct actuator behavior.
+- ✅ Scheduled open/close transitions work without manual intervention.
+- ✅ Returning from manual to auto mode correctly resyncs door state with current time.
+
+**Bench test is largely complete.** One bench-side item remains before physical install: Stage 5d below, which transitions Arduino off USB and onto VIN-from-12V-bus power. After that, remaining work is physical: enclosure mounting, door mechanism integration, solar panel installation, and field tuning of `OPEN_TIME` / `CLOSE_TIME` — plus the optional Stage 6 sleep-mode optimization, planned for a later session.
 
 **Open questions from bench testing — to revisit in a later session:**
 
@@ -592,6 +603,39 @@ These came up while running the Stage 5c sketch. The system passes the stated 5c
 1. **Switch flip during a movement is ignored until the move completes.** If a 27-second open or close is in progress and the lever is moved (e.g., from Position II back to center, or from Position II directly to Position I), the Arduino does not react until the current `delay(ACTUATOR_TRAVEL_MS)` returns. This is a direct consequence of the blocking-delay design in Section 5's `open_door()` / `close_door()` functions and is consistent with the architecture as written — but it feels unresponsive in practice. Worth deciding whether the switch should be able to interrupt (and possibly reverse) an in-progress move. If yes, this requires moving from blocking delays to a non-blocking state-machine `loop()`, which is the same shift Stage 6 needs for sleep mode anyway. Considerations include: how to track door position when a move is aborted mid-travel (introduce an `UNKNOWN` state? always run full duration on next move?), and whether the switch should be able to *reverse* a move in flight or only *stop* it.
 
 2. **After a manual override, returning the switch to center can immediately trigger the opposite move.** Specifically: if the schedule's open window has already passed and the user manually opens the door via Position II, then flips back to center, auto mode evaluates `is_open_hours()` as false and immediately closes the door. This is the documented "switch-to-center resyncs door state" behavior from Section 4 working exactly as designed — the door always converges to the schedule's expected state once auto mode resumes. It only feels surprising during bench testing because the test windows are short (a few minutes). In normal field operation the schedule will be hours long, so manually opening at noon and flipping back to auto won't trigger a close. No code change needed; this is captured here as a reminder when reviewing observation 1, since any change to switch responsiveness should preserve this resync behavior, not break it.
+
+#### 5d: Transition Arduino to VIN Power (Off USB)
+
+**Goal:** Move Arduino from USB-powered to 12V-bus-powered via the VIN pin, matching the architecture's intended power topology (Section 3, Section 6). Verify the system runs correctly without a USB tether before the unit is mounted in the enclosure.
+
+**Why this is its own stage:** Every bench stage so far (1 through 5c) has run with Arduino on USB — initially because the Serial Monitor was needed for debugging, and later because the wiring just stayed that way. The VIN-from-12V-bus path is in the architecture diagram and pin map but has never been exercised. Catching any VIN-related issue (regulator heating, brownout during actuator inrush, RTC reset on power transition) on the bench is much easier than catching it after the unit is sealed in an enclosure on the coop.
+
+**Connections to add:**
+| From | To | Notes |
+|---|---|---|
+| 12V+ junction | Arduino VIN | New wire — feeds Arduino through its onboard linear regulator |
+| GND junction | (already connected via Stage 4) | No new wire needed — Arduino GND is already tied to the common ground from Stage 4 |
+
+The 12V+ junction grows from 4 wires (JD-VCC, P1006 LOAD+, R1 NO, R2 NO) to 5 wires (+ Arduino VIN).
+
+**Steps:**
+1. Pull the inline fuse to de-energize the 12V bus.
+2. Land a new wire from the 12V+ junction to Arduino VIN.
+3. Disconnect Arduino USB.
+4. Reinsert the fuse → P1006 should power up, and Arduino should boot from VIN.
+5. Verify boot: forced-close routine runs (27 s extend), `door_state = CLOSED`. Onboard power LED on Arduino should be lit; the relay channel LEDs should follow the boot-time exercise as before.
+6. **Optional debug aid:** USB *can* be reconnected for Serial Monitor while VIN is also live — the Arduino Uno's onboard circuitry handles dual-source power safely (it auto-selects the higher source, typically VIN at ~12V over USB at ~5V). Useful if you want to watch serial output during the test without removing the VIN wire.
+7. With USB disconnected, run a full open/close cycle on schedule (same `OPEN_TIME` / `CLOSE_TIME` window as Stage 5c) to confirm the system behaves identically on VIN power.
+8. During each actuator run, watch for any sign of brownout — Arduino reset (would re-trigger the forced-close), RTC time loss, or relay glitches. The actuator's ~1 A inrush is the biggest stress event for the regulator path, so the open/close cycle is the real test.
+
+**Pass criteria (Stage 5d):**
+- Arduino boots and runs correctly with only VIN power (USB unplugged).
+- Forced-close routine completes on power-up.
+- Full scheduled open/close cycle works without USB connected.
+- No brownout, reset, or RTC time loss during actuator runs.
+- Onboard regulator does not get noticeably hot to the touch after a full cycle (warm is fine; uncomfortably hot suggests it's working too hard and a buck converter should be considered).
+
+**If brownout or regulator heat is a problem:** The Arduino Uno's linear regulator drops 12 V → 5 V by burning the difference as heat (~7 V × ~50 mA ≈ 0.35 W at idle, more during peripheral activity). It's borderline acceptable for this load but not great. A small buck converter (12 V → 5 V or 12 V → 7 V into VIN) would solve it. This is an "if it becomes a problem" addition, not required up front. Note that Section 2's row 9 currently says "no buck converter needed" — if one is added here, update that row accordingly.
 
 ### Stage 6: Power Optimization via Sleep Mode
 
@@ -825,8 +869,9 @@ Door movement functions (`open_door`, `close_door`) remain identical to Stage 5 
 6. ~~Stage 4 — Add battery + P1006 charge controller, energize relay coils via JD-VCC~~ (done, audible clicks on every transition, no boot glitches, LOAD active without PV)
 7. ~~Stage 5a — Install inline 7.5A fuse, wire actuator through relays in H-bridge~~ (done, fuse seated, junctions extended with R1/R2 NC→GND and R1/R2 NO→12V+, no shorts)
 8. ~~Stage 5b — Direction verification with 3-second bursts~~ (done, R1 extends and R2 retracts as designed, no lead swap needed)
-9. **Stage 5c — Upload full control code, run end-to-end bench test (power-on forced-close, scheduled open/close, all three switch positions, switch-to-auto resync)** ← next
-10. Stage 6 — Add deep sleep (PWR_DOWN + watchdog + switch interrupts) to extend battery life
-11. Mount in enclosure and install on coop
-12. Add solar panel to charge controller PV terminals (if deferred from Stage 5)
-13. Field test and tune timing
+9. ~~Stage 5c — Upload full control code, run end-to-end bench test (power-on forced-close, scheduled open/close, all three switch positions, switch-to-auto resync)~~ (done, all four pass criteria met)
+10. **Stage 5d — Transition Arduino from USB to VIN-from-12V-bus power, verify full cycle still works without USB tether** ← next
+11. Stage 6 — Add deep sleep (PWR_DOWN + watchdog + switch interrupts) to extend battery life (planned for a later session)
+12. Mount in enclosure and install on coop
+13. Add solar panel to charge controller PV terminals (if deferred from Stage 5)
+14. Field test and tune timing
